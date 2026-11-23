@@ -18,7 +18,8 @@ on:
     branches:
       - main
     paths:
-      - 'patches/**'
+      - 'overlay/**'
+      - 'tools/patcher/**'
       - '.github/workflows/auto-build.yml'
 
 permissions:
@@ -88,6 +89,11 @@ jobs:
           go-version: '1.26'
           cache: false
 
+      - name: Test semantic patcher
+        run: |
+          set -euo pipefail
+          (cd tools/patcher && go test -v ./...)
+
       - name: Clone upstream mihomo and locked sing-tun
         env:
           TAG: ${{ needs.check.outputs.tag }}
@@ -107,23 +113,19 @@ jobs:
             git -C upstream/sing-tun checkout "$COMMIT"
           fi
 
-      - name: Apply patches
+      - name: Apply overlays and semantic AST patches
         id: patch
         env:
           TAG: ${{ needs.check.outputs.tag }}
         run: |
           set -euo pipefail
-          for p in patches/sing-tun/*.patch; do
-            echo "Applying $p"
-            git -C upstream/sing-tun apply "$GITHUB_WORKSPACE/$p"
-          done
-          for p in patches/mihomo/*.patch; do
-            echo "Applying $p"
-            git -C upstream/mihomo apply "$GITHUB_WORKSPACE/$p"
-          done
+          (cd tools/patcher && go run . -sing-tun "$GITHUB_WORKSPACE/upstream/sing-tun" -mihomo "$GITHUB_WORKSPACE/upstream/mihomo" -overlay "$GITHUB_WORKSPACE/overlay")
           (cd upstream/mihomo && go mod edit -replace github.com/metacubex/sing-tun=../sing-tun)
+          mkdir -p dist
+          git -C upstream/sing-tun diff > dist/sing-tun-semantic.diff
+          git -C upstream/mihomo diff > dist/mihomo-semantic.diff
 
-      - name: Report patch conflict issue on failure
+      - name: Report semantic patch failure issue
         if: failure() && steps.patch.outcome == 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -131,9 +133,9 @@ jobs:
           SING_TUN_VER: ${{ env.SING_TUN_VER }}
         run: |
           set -euo pipefail
-          TITLE="Patch conflict on upstream ${TAG}"
+          TITLE="Semantic patcher failure on upstream ${TAG}"
           EXISTING=$(gh issue list --repo "${{ github.repository }}" --state open --search "\"$TITLE\" in:title" --json number --jq '.[0].number // empty')
-          BODY=$(printf "Automated patch application failed for upstream **%s** (sing-tun %s).\n\nWorkflow run: %s/actions/runs/%s\n" \
+          BODY=$(printf "Automated Overlay + Go AST semantic patching failed for upstream **%s** (sing-tun %s).\n\nWorkflow run: %s/actions/runs/%s\n" \
             "$TAG" "${SING_TUN_VER:-unknown}" "${{ github.server_url }}" "${{ github.run_id }}")
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --repo "${{ github.repository }}" --body "$BODY"
@@ -209,7 +211,7 @@ jobs:
           if [ "$INPUT_FORCE" = "true" ] && gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             gh release delete "$TAG" --repo "${{ github.repository }}" -y
           fi
-          NOTES=$(printf "Custom Mihomo build tracking upstream **%s** (sing-tun **%s**).\n\nApplied patches:\n- \`patches/sing-tun/0001-default-interface-priority.patch\`: declarative \`tun.default-interface-priority\` order + metric tie-break stickiness\n- \`patches/mihomo/0001-tun-interface-priority-and-reset-conns.patch\`: \`tun.default-interface-priority\` config wiring, \`autoCloseProxyAdapter\` unwrapping + stale connection & \`anytls\` session pool reset on default interface switch\n- \`patches/mihomo/0002-outbound-reset-sessions.patch\`: non-destructive \`ResetSessions()\` across remaining stateful/pooled outbound protocols (\`singmux\`, \`gun\`/\`xhttp\`/\`mekya\`, \`hysteria2\`/\`hysteria\`/\`tuic\`/\`shadowquic\`/\`trusttunnel\`, \`ssh\`/\`snell\`/\`kcptun\`/\`sudoku\`/\`mieru\`, \`masque\`/\`openvpn\`/\`wireguard\`)\n" "$TAG" "$SING_TUN_VER")
+          NOTES=$(printf "Custom Mihomo build tracking upstream **%s** (sing-tun **%s**) via Package Overlays + Go AST Semantic Patcher.\n\nApplied semantic features:\n- \`sing-tun\` overlay + AST patch: declarative \`tun.default-interface-priority\` order + metric tie-break stickiness\n- \`mihomo\` TUN overlay + AST patch: \`tun.default-interface-priority\` config wiring, \`autoCloseProxyAdapter\` unwrapping, and bounded stale connection reset on default interface switch\n- \`mihomo\` Outbound overlay + AST patch: non-destructive \`ResetSessions()\` across \`anytls\`, \`singmux\`, \`gun\`/\`xhttp\`/\`mekya\`, \`hysteria2\`/\`hysteria\`/\`tuic\`/\`shadowquic\`/\`trusttunnel\`, \`ssh\`/\`snell\`/\`kcptun\`/\`sudoku\`/\`mieru\`, \`masque\`/\`openvpn\`/\`wireguard\`\n" "$TAG" "$SING_TUN_VER")
           gh release create "$TAG" dist/*.zip dist/SHA256SUMS.txt \
             --repo "${{ github.repository }}" \
             --title "$TAG" \

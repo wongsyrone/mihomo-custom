@@ -1,4 +1,6 @@
 * text=auto eol=lf
+*.go text eol=lf
+*.mod text eol=lf
 *.patch text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
