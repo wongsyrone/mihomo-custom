@@ -63,7 +63,7 @@ func (t *interfaceSwitchTracker) onInterfaceUpdate(defaultInterface *control.Int
 }
 
 func unwrapAdapter(a any) any {
-	for range 8 {
+	for i := 0; i < 8; i++ {
 		if a == nil {
 			return nil
 		}

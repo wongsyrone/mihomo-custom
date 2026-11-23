@@ -2,7 +2,7 @@ package config
 
 import (
 	"encoding/json"
-	"slices"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -33,7 +33,7 @@ func TestTunDefaultInterfacePriorityCompat(t *testing.T) {
 			t.Fatalf("UnmarshalRawConfig failed: %v", err)
 		}
 		want := []string{"Wi-Fi", "Ethernet 2"}
-		if !slices.Equal(rawCfg.Tun.DefaultInterfacePriority, want) {
+		if !reflect.DeepEqual(rawCfg.Tun.DefaultInterfacePriority, want) {
 			t.Fatalf("got %v, want %v", rawCfg.Tun.DefaultInterfacePriority, want)
 		}
 	})

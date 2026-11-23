@@ -158,7 +158,10 @@ jobs:
             go test -v -run 'TestPoolReset' ./component/pool ./transport/snell
             go test -v -run 'TestClientResetSessions|TestReuseManagerAndClientResetSessions|TestPoolClientResetSessions' ./transport/gun ./transport/xhttp ./transport/mekya ./transport/tuic
             go test -v -run 'TestAutoCloseAndSingMuxResetSessions|TestWireGuardResetSessionsCallsBindUpdate|TestOutboundResetSessionsNilSafe' ./adapter/outbound
-            GOOS=windows GOARCH=amd64 go test -tags with_gvisor -c -o /dev/null ./listener/sing_tun ./config ./listener/config ./adapter/outbound ./component/pool ./transport/anytls/session ./transport/gun ./transport/xhttp ./transport/mekya ./transport/tuic ./transport/tuic/v4 ./transport/tuic/v5 ./transport/hysteria/core ./transport/shadowquic ./transport/trusttunnel ./transport/snell ./transport/kcptun ./transport/sudoku ./transport/masque
+            GOOS=windows GOARCH=amd64 go build -tags with_gvisor ./listener/sing_tun ./config ./listener/config ./adapter/outbound ./component/pool ./transport/anytls/session ./transport/gun ./transport/xhttp ./transport/mekya ./transport/tuic ./transport/tuic/v4 ./transport/tuic/v5 ./transport/hysteria/core ./transport/shadowquic ./transport/trusttunnel ./transport/snell ./transport/kcptun ./transport/sudoku ./transport/masque
+            for pkg in ./listener/sing_tun ./config ./adapter/outbound ./component/pool ./transport/anytls/session ./transport/gun ./transport/xhttp ./transport/mekya ./transport/tuic ./transport/snell; do
+              GOOS=windows GOARCH=amd64 go test -tags with_gvisor -c -o /dev/null "$pkg"
+            done
           )
 
       - name: Refresh embedded CA certificates
