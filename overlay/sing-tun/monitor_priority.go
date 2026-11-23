@@ -1,15 +1,19 @@
 // Problem:
-// On multi-homed Windows hosts using Automatic Metric, multiple active adapters
-// (e.g., Wi-Fi and wired Ethernet) frequently hold 0.0.0.0/0 default routes with
-// equal or close combined metrics (row.Metric + iface.Metric). Minor link-speed
-// changes or virtual switch updates trigger checkUpdate() oscillations, and
-// equal-metric ties previously depended on OS route table iteration order.
+// On multi-homed hosts, multiple active adapters (e.g., Wi-Fi and wired
+// Ethernet) frequently hold default routes with equal or competing metrics
+// (Windows Automatic Metric row.Metric + iface.Metric, Linux netlink route
+// Priority, or macOS BSD RIB order / RTF_IFSCOPE). Minor link updates or route
+// table iteration order trigger checkUpdate() oscillations or pick an undesired
+// adapter over the user's preferred interface.
 //
 // Solution:
 // Deduplicate default-route candidates per interface index by lowest metric and
-// select deterministically: honor PreferredInterfaces order first (ignoring
-// metric jitter), then fall back to lowest combined metric with equal-metric
-// stickiness to the currently active interface name.
+// select deterministically across Windows, Linux, and macOS: honor
+// PreferredInterfaces order first (ignoring metric jitter or scoped flags),
+// then fall back to lowest metric with equal-metric stickiness to the currently
+// active interface name.
+
+//go:build linux || windows || darwin
 
 package tun
 

@@ -143,13 +143,15 @@ jobs:
             gh issue create --repo "${{ github.repository }}" --title "$TITLE" --body "$BODY"
           fi
 
-      - name: Run unit tests and Windows compile checks
+      - name: Run unit tests and cross-platform compile checks
         run: |
           set -euo pipefail
           (
             cd upstream/sing-tun
             go test -v -run TestSelectDefaultInterface .
             GOOS=windows GOARCH=amd64 go test -c -o /dev/null .
+            GOOS=linux GOARCH=amd64 go test -c -o /dev/null .
+            GOOS=darwin GOARCH=arm64 go test -c -o /dev/null .
           )
           (
             cd upstream/mihomo
@@ -172,7 +174,7 @@ jobs:
           sudo update-ca-certificates
           cp -f /etc/ssl/certs/ca-certificates.crt upstream/mihomo/component/ca/ca-certificates.crt
 
-      - name: Build Windows amd64 binaries
+      - name: Build release binaries (Windows, Linux, macOS)
         env:
           TAG: ${{ needs.check.outputs.tag }}
         run: |
@@ -185,14 +187,29 @@ jobs:
             cd upstream/mihomo
             CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOAMD64=v3 go build -tags with_gvisor -trimpath -ldflags "$LDFLAGS" -o "$GITHUB_WORKSPACE/dist/mihomo-windows-amd64.exe"
             CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOAMD64=v1 go build -tags with_gvisor -trimpath -ldflags "$LDFLAGS" -o "$GITHUB_WORKSPACE/dist/mihomo-windows-amd64-compatible.exe"
+            CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -tags with_gvisor -trimpath -ldflags "$LDFLAGS" -o "$GITHUB_WORKSPACE/dist/mihomo-windows-arm64.exe"
+
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v3 go build -tags with_gvisor -trimpath -ldflags "$LDFLAGS" -o "$GITHUB_WORKSPACE/dist/mihomo-linux-amd64"
+            CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags with_gvisor -trimpath -ldflags "$LDFLAGS" -o "$GITHUB_WORKSPACE/dist/mihomo-linux-arm64"
+
+            CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 GOAMD64=v3 go build -tags with_gvisor -trimpath -ldflags "$LDFLAGS" -o "$GITHUB_WORKSPACE/dist/mihomo-darwin-amd64"
+            CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -tags with_gvisor -trimpath -ldflags "$LDFLAGS" -o "$GITHUB_WORKSPACE/dist/mihomo-darwin-arm64"
           )
 
           (
             cd dist
             zip -9 "mihomo-windows-amd64-${TAG}.zip" mihomo-windows-amd64.exe
             zip -9 "mihomo-windows-amd64-compatible-${TAG}.zip" mihomo-windows-amd64-compatible.exe
-            rm -f mihomo-windows-amd64.exe mihomo-windows-amd64-compatible.exe
-            sha256sum *.zip > SHA256SUMS.txt
+            zip -9 "mihomo-windows-arm64-${TAG}.zip" mihomo-windows-arm64.exe
+            rm -f mihomo-windows-amd64.exe mihomo-windows-amd64-compatible.exe mihomo-windows-arm64.exe
+
+            gzip -9 -c mihomo-linux-amd64 > "mihomo-linux-amd64-${TAG}.gz"
+            gzip -9 -c mihomo-linux-arm64 > "mihomo-linux-arm64-${TAG}.gz"
+            gzip -9 -c mihomo-darwin-amd64 > "mihomo-darwin-amd64-${TAG}.gz"
+            gzip -9 -c mihomo-darwin-arm64 > "mihomo-darwin-arm64-${TAG}.gz"
+            rm -f mihomo-linux-amd64 mihomo-linux-arm64 mihomo-darwin-amd64 mihomo-darwin-arm64
+
+            sha256sum *.zip *.gz > SHA256SUMS.txt
             cat SHA256SUMS.txt
           )
 
@@ -214,8 +231,8 @@ jobs:
           if [ "$INPUT_FORCE" = "true" ] && gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             gh release delete "$TAG" --repo "${{ github.repository }}" -y
           fi
-          NOTES=$(printf "Custom Mihomo build tracking upstream **%s** (sing-tun **%s**) via Package Overlays + Go AST Semantic Patcher.\n\nApplied semantic features:\n- \`sing-tun\` overlay + AST patch: declarative \`tun.default-interface-priority\` order + metric tie-break stickiness\n- \`mihomo\` TUN overlay + AST patch: \`tun.default-interface-priority\` config wiring, \`autoCloseProxyAdapter\` unwrapping, and bounded stale connection reset on default interface switch\n- \`mihomo\` Outbound overlay + AST patch: non-destructive \`ResetSessions()\` across \`anytls\`, \`singmux\`, \`gun\`/\`xhttp\`/\`mekya\`, \`hysteria2\`/\`hysteria\`/\`tuic\`/\`shadowquic\`/\`trusttunnel\`, \`ssh\`/\`snell\`/\`kcptun\`/\`sudoku\`/\`mieru\`, \`masque\`/\`openvpn\`/\`wireguard\`\n" "$TAG" "$SING_TUN_VER")
-          gh release create "$TAG" dist/*.zip dist/SHA256SUMS.txt \
+          NOTES=$(printf "Custom Mihomo build tracking upstream **%s** (sing-tun **%s**) via Package Overlays + Go AST Semantic Patcher.\n\nRelease binaries:\n- Windows: \`amd64\` (v3), \`amd64-compatible\` (v1), \`arm64\` (\`.zip\`)\n- Linux: \`amd64\` (v3), \`arm64\` (\`.gz\`)\n- macOS: \`amd64\` (v3), \`arm64\` (\`.gz\`)\n\nApplied semantic features:\n- \`sing-tun\` overlay + AST patch: declarative \`tun.default-interface-priority\` order + metric tie-break stickiness on Windows, Linux (\`netlink\`), and macOS (\`AF_ROUTE\`)\n- \`mihomo\` TUN overlay + AST patch: \`tun.default-interface-priority\` config wiring, \`autoCloseProxyAdapter\` unwrapping, and bounded stale connection reset on default interface switch\n- \`mihomo\` Outbound overlay + AST patch: non-destructive \`ResetSessions()\` across \`anytls\`, \`singmux\`, \`gun\`/\`xhttp\`/\`mekya\`, \`hysteria2\`/\`hysteria\`/\`tuic\`/\`shadowquic\`/\`trusttunnel\`, \`ssh\`/\`snell\`/\`kcptun\`/\`sudoku\`/\`mieru\`, \`masque\`/\`openvpn\`/\`wireguard\`\n" "$TAG" "$SING_TUN_VER")
+          gh release create "$TAG" dist/*.zip dist/*.gz dist/SHA256SUMS.txt \
             --repo "${{ github.repository }}" \
             --title "$TAG" \
             --notes "$NOTES"

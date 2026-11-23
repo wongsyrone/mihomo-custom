@@ -1,3 +1,5 @@
+//go:build linux || windows || darwin
+
 package tun
 
 import "testing"
@@ -59,6 +61,46 @@ func TestSelectDefaultInterface(t *testing.T) {
 		alias, idx, ok := s.selectFor(nil)
 		if !ok || alias != "Wi-Fi" || idx != 1 {
 			t.Fatalf("got (%q, %d, %v), want (\"Wi-Fi\", 1, true)", alias, idx, ok)
+		}
+	})
+
+	t.Run("linux preferred overrides lower netlink metric", func(t *testing.T) {
+		eth := defaultRouteCandidate{Alias: "eth0", Index: 2, Metric: 100}
+		wlan := defaultRouteCandidate{Alias: "wlan0", Index: 3, Metric: 600}
+
+		got, ok := selectDefaultInterface([]defaultRouteCandidate{eth, wlan}, []string{"wlan0", "eth0"}, "eth0")
+		if !ok || got.Alias != "wlan0" {
+			t.Fatalf("got (%+v, %v), want wlan0", got, ok)
+		}
+
+		got, ok = selectDefaultInterface([]defaultRouteCandidate{eth, wlan}, nil, "")
+		if !ok || got.Alias != "eth0" {
+			t.Fatalf("got (%+v, %v), want eth0 when preferred is nil", got, ok)
+		}
+	})
+
+	t.Run("darwin scoped preferred overrides unscoped primary", func(t *testing.T) {
+		en7 := defaultRouteCandidate{Alias: "en7", Index: 7, Metric: 0}
+		en0 := defaultRouteCandidate{Alias: "en0", Index: 4, Metric: (1 << 30) + 1}
+
+		got, ok := selectDefaultInterface([]defaultRouteCandidate{en7, en0}, []string{"en0", "en7"}, "en7")
+		if !ok || got.Alias != "en0" {
+			t.Fatalf("got (%+v, %v), want en0", got, ok)
+		}
+
+		got, ok = selectDefaultInterface([]defaultRouteCandidate{en7}, []string{"en0", "en7"}, "en0")
+		if !ok || got.Alias != "en7" {
+			t.Fatalf("got (%+v, %v), want en7 when en0 absent", got, ok)
+		}
+	})
+
+	t.Run("darwin unscoped beats scoped when preferred unset", func(t *testing.T) {
+		en0 := defaultRouteCandidate{Alias: "en0", Index: 4, Metric: 1 << 30}
+		en7 := defaultRouteCandidate{Alias: "en7", Index: 7, Metric: 1}
+
+		got, ok := selectDefaultInterface([]defaultRouteCandidate{en0, en7}, nil, "en0")
+		if !ok || got.Alias != "en7" {
+			t.Fatalf("got (%+v, %v), want en7", got, ok)
 		}
 	})
 }

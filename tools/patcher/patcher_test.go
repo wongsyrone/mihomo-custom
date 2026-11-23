@@ -44,6 +44,10 @@ func assertValidGoFiles(t *testing.T, root string, rels []string) map[string]str
 	return out
 }
 
+func collapseWS(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
 func TestPatchSingTun(t *testing.T) {
 	dir := t.TempDir()
 	writeFixtureFiles(t, dir, map[string]string{
@@ -114,14 +118,95 @@ func (m *defaultInterfaceMonitor) checkUpdate() error {
 	return nil
 }
 `,
+		"monitor_linux_default.go": `package tun
+
+func (m *defaultInterfaceMonitor) checkUpdate() error {
+	routes, err := netlink.RouteListFiltered(netlink.FAMILY_ALL, &netlink.Route{Table: unix.RT_TABLE_MAIN}, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		return err
+	}
+	for _, route := range routes {
+		if route.Dst != nil {
+			continue
+		}
+
+		var link netlink.Link
+		link, err = netlink.LinkByIndex(route.LinkIndex)
+		if err != nil {
+			return err
+		}
+
+		newInterface, err := m.interfaceFinder.ByIndex(link.Attrs().Index)
+		if err != nil {
+			return E.Cause(err, "find updated interface: ", link.Attrs().Name)
+		}
+		oldInterface := m.defaultInterface.Swap(newInterface)
+		if oldInterface != nil && oldInterface.Equals(*newInterface) {
+			return nil
+		}
+		m.emit(newInterface, 0)
+		return nil
+	}
+	return ErrNoRoute
+}
+`,
+		"monitor_darwin.go": `package tun
+
+func (m *defaultInterfaceMonitor) checkUpdate() error {
+	var (
+		defaultInterface *control.Interface
+		err              error
+	)
+	if m.underNetworkExtension {
+		defaultInterface, err = m.getDefaultInterfaceBySocket()
+		if err != nil {
+			return err
+		}
+	} else {
+		ribMessage, err := route.FetchRIB(unix.AF_UNSPEC, route.RIBTypeRoute, 0)
+		if err != nil {
+			return err
+		}
+		routeMessages, err := route.ParseRIB(route.RIBTypeRoute, ribMessage)
+		if err != nil {
+			return err
+		}
+		for _, rawRouteMessage := range routeMessages {
+			routeMessage := rawRouteMessage.(*route.RouteMessage)
+			if len(routeMessage.Addrs) <= unix.RTAX_NETMASK {
+				continue
+			}
+			routeInterface, err := m.interfaceFinder.ByIndex(routeMessage.Index)
+			if err != nil {
+				return err
+			}
+			if routeMessage.Flags&unix.RTF_UP == 0 {
+				continue
+			}
+			defaultInterface = routeInterface
+			break
+		}
+	}
+	if defaultInterface == nil {
+		return ErrNoRoute
+	}
+	return nil
+}
+`,
 	})
 
 	if err := patchSingTun(dir); err != nil {
 		t.Fatalf("patchSingTun failed: %v", err)
 	}
 
-	got := assertValidGoFiles(t, dir, []string{"monitor.go", "monitor_shared.go", "monitor_windows.go"})
-	if !strings.Contains(strings.Join(strings.Fields(got["monitor.go"]), " "), "PreferredInterfaces []string") {
+	got := assertValidGoFiles(t, dir, []string{
+		"monitor.go",
+		"monitor_shared.go",
+		"monitor_windows.go",
+		"monitor_linux_default.go",
+		"monitor_darwin.go",
+	})
+	if !strings.Contains(collapseWS(got["monitor.go"]), "PreferredInterfaces []string") {
 		t.Fatalf("monitor.go missing PreferredInterfaces:\n%s", got["monitor.go"])
 	}
 	if !strings.Contains(got["monitor_shared.go"], "filterPreferredInterfaces(options.PreferredInterfaces)") {
@@ -133,6 +218,25 @@ func (m *defaultInterfaceMonitor) checkUpdate() error {
 	if !strings.Contains(got["monitor_windows.go"], "_routeSelector.add(ifrow.Alias(), int(ifrow.InterfaceIndex), metric)") ||
 		!strings.Contains(got["monitor_windows.go"], "_routeSelector.selectFor(m)") {
 		t.Fatalf("monitor_windows.go missing selector calls:\n%s", got["monitor_windows.go"])
+	}
+
+	linuxText := got["monitor_linux_default.go"]
+	if !strings.Contains(linuxText, "_routeSelector.add(link.Attrs().Name, link.Attrs().Index, _routeMetric)") ||
+		!strings.Contains(linuxText, "route.Priority > 0") ||
+		!strings.Contains(linuxText, "_routeSelector.selectFor(m)") ||
+		!strings.Contains(collapseWS(linuxText), "if err != nil { continue }") {
+		t.Fatalf("monitor_linux_default.go missing expected selector wiring:\n%s", linuxText)
+	}
+
+	darwinText := got["monitor_darwin.go"]
+	if !strings.Contains(darwinText, "var _routeSelector defaultRouteSelector") ||
+		!strings.Contains(darwinText, "routeMessage.Flags&unix.RTF_IFSCOPE != 0") ||
+		!strings.Contains(darwinText, "_routeSelector.add(routeInterface.Name, routeInterface.Index, _routeMetric)") ||
+		!strings.Contains(darwinText, "_routeSelector.selectFor(m)") ||
+		!strings.Contains(darwinText, "m.getDefaultInterfaceBySocket()") ||
+		!strings.Contains(collapseWS(darwinText), "if err != nil { continue }") ||
+		strings.Contains(darwinText, "defaultInterface = routeInterface") {
+		t.Fatalf("monitor_darwin.go missing expected selector wiring:\n%s", darwinText)
 	}
 }
 
@@ -380,10 +484,18 @@ func (w *Masque) startLocked(ctx context.Context) error {
 func TestPatchFailsExplicitlyOnMissingAnchor(t *testing.T) {
 	dir := t.TempDir()
 	writeFixtureFiles(t, dir, map[string]string{
-		"monitor.go": "package tun\ntype RenamedOptions struct{}\n",
+		"monitor.go":               "package tun\ntype RenamedOptions struct{}\n",
+		"monitor_linux_default.go": "package tun\nfunc (m *defaultInterfaceMonitor) checkUpdate() error { return nil }\n",
+		"monitor_darwin.go":        "package tun\nfunc (m *defaultInterfaceMonitor) checkUpdate() error { return nil }\n",
 	})
 	if err := patchSingTunMonitorGo(filepath.Join(dir, "monitor.go")); err == nil {
 		t.Fatal("expected error when DefaultInterfaceMonitorOptions is missing")
+	}
+	if err := patchSingTunMonitorLinuxDefaultGo(filepath.Join(dir, "monitor_linux_default.go")); err == nil {
+		t.Fatal("expected error when routes range loop is missing in monitor_linux_default.go")
+	}
+	if err := patchSingTunMonitorDarwinGo(filepath.Join(dir, "monitor_darwin.go")); err == nil {
+		t.Fatal("expected error when routeMessages range loop is missing in monitor_darwin.go")
 	}
 }
 
