@@ -121,7 +121,7 @@ func (m *defaultInterfaceMonitor) checkUpdate() error {
 	}
 
 	got := assertValidGoFiles(t, dir, []string{"monitor.go", "monitor_shared.go", "monitor_windows.go"})
-	if !strings.Contains(got["monitor.go"], "PreferredInterfaces []string") {
+	if !strings.Contains(strings.Join(strings.Fields(got["monitor.go"]), " "), "PreferredInterfaces []string") {
 		t.Fatalf("monitor.go missing PreferredInterfaces:\n%s", got["monitor.go"])
 	}
 	if !strings.Contains(got["monitor_shared.go"], "filterPreferredInterfaces(options.PreferredInterfaces)") {
