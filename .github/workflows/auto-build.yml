@@ -1,0 +1,213 @@
+name: Build Custom Mihomo
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream mihomo tag (empty = latest release)'
+        required: false
+        type: string
+      force:
+        description: 'Force rebuild and overwrite release if it already exists'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - main
+    paths:
+      - 'patches/**'
+      - '.github/workflows/auto-build.yml'
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: auto-build-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+      should_release: ${{ steps.resolve.outputs.should_release }}
+    steps:
+      - name: Resolve target upstream tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG=$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r '.tag_name')
+          fi
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "Failed to resolve upstream release tag" >&2
+            exit 1
+          fi
+
+          EXISTS=false
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            EXISTS=true
+          fi
+
+          SHOULD_BUILD=false
+          SHOULD_RELEASE=false
+          if [ "$EXISTS" = "false" ] || [ "$INPUT_FORCE" = "true" ]; then
+            SHOULD_BUILD=true
+            SHOULD_RELEASE=true
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            SHOULD_BUILD=true
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          echo "should_release=$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=$TAG exists=$EXISTS should_build=$SHOULD_BUILD should_release=$SHOULD_RELEASE"
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout patch repo
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: false
+
+      - name: Clone upstream mihomo and locked sing-tun
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p upstream
+          git clone --depth 1 --branch "$TAG" https://github.com/MetaCubeX/mihomo.git upstream/mihomo
+          SING_TUN_VER=$(awk '/github\.com\/metacubex\/sing-tun[[:space:]]/{print $2; exit}' upstream/mihomo/go.mod)
+          if [ -z "$SING_TUN_VER" ]; then
+            echo "Could not find sing-tun version in upstream/mihomo/go.mod" >&2
+            exit 1
+          fi
+          echo "SING_TUN_VER=$SING_TUN_VER" >> "$GITHUB_ENV"
+          if ! git clone --depth 1 --branch "$SING_TUN_VER" https://github.com/MetaCubeX/sing-tun.git upstream/sing-tun; then
+            COMMIT=$(echo "$SING_TUN_VER" | awk -F- '{print $NF}')
+            git clone https://github.com/MetaCubeX/sing-tun.git upstream/sing-tun
+            git -C upstream/sing-tun checkout "$COMMIT"
+          fi
+
+      - name: Apply patches
+        id: patch
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          for p in patches/sing-tun/*.patch; do
+            echo "Applying $p"
+            git -C upstream/sing-tun apply "$GITHUB_WORKSPACE/$p"
+          done
+          for p in patches/mihomo/*.patch; do
+            echo "Applying $p"
+            git -C upstream/mihomo apply "$GITHUB_WORKSPACE/$p"
+          done
+          (cd upstream/mihomo && go mod edit -replace github.com/metacubex/sing-tun=../sing-tun)
+
+      - name: Report patch conflict issue on failure
+        if: failure() && steps.patch.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+          SING_TUN_VER: ${{ env.SING_TUN_VER }}
+        run: |
+          set -euo pipefail
+          TITLE="Patch conflict on upstream ${TAG}"
+          EXISTING=$(gh issue list --repo "${{ github.repository }}" --state open --search "\"$TITLE\" in:title" --json number --jq '.[0].number // empty')
+          BODY=$(printf "Automated patch application failed for upstream **%s** (sing-tun %s).\n\nWorkflow run: %s/actions/runs/%s\n" \
+            "$TAG" "${SING_TUN_VER:-unknown}" "${{ github.server_url }}" "${{ github.run_id }}")
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "${{ github.repository }}" --body "$BODY"
+          else
+            gh issue create --repo "${{ github.repository }}" --title "$TITLE" --body "$BODY"
+          fi
+
+      - name: Run unit tests and Windows compile checks
+        run: |
+          set -euo pipefail
+          (
+            cd upstream/sing-tun
+            go test -v -run TestSelectDefaultInterface .
+            GOOS=windows GOARCH=amd64 go test -c -o /dev/null .
+          )
+          (
+            cd upstream/mihomo
+            go test -v ./transport/anytls/session ./listener/sing_tun
+            go test -v -run TestTunDefaultInterfacePriorityCompat ./config
+            GOOS=windows GOARCH=amd64 go test -tags with_gvisor -c -o /dev/null ./listener/sing_tun ./config ./listener/config ./adapter/outbound
+          )
+
+      - name: Refresh embedded CA certificates
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates
+          sudo update-ca-certificates
+          cp -f /etc/ssl/certs/ca-certificates.crt upstream/mihomo/component/ca/ca-certificates.crt
+
+      - name: Build Windows amd64 binaries
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          BUILDTIME=$(date -u)
+          LDFLAGS="-X \"github.com/metacubex/mihomo/constant.Version=${TAG}-custom\" -X \"github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}\" -w -s -buildid="
+
+          (
+            cd upstream/mihomo
+            CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOAMD64=v3 go build -tags with_gvisor -trimpath -ldflags "$LDFLAGS" -o "$GITHUB_WORKSPACE/dist/mihomo-windows-amd64.exe"
+            CGO_ENABLED=0 GOOS=windows GOARCH=amd64 GOAMD64=v1 go build -tags with_gvisor -trimpath -ldflags "$LDFLAGS" -o "$GITHUB_WORKSPACE/dist/mihomo-windows-amd64-compatible.exe"
+          )
+
+          (
+            cd dist
+            zip -9 "mihomo-windows-amd64-${TAG}.zip" mihomo-windows-amd64.exe
+            zip -9 "mihomo-windows-amd64-compatible-${TAG}.zip" mihomo-windows-amd64-compatible.exe
+            rm -f mihomo-windows-amd64.exe mihomo-windows-amd64-compatible.exe
+            sha256sum *.zip > SHA256SUMS.txt
+            cat SHA256SUMS.txt
+          )
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-custom-${{ needs.check.outputs.tag }}
+          path: dist/
+
+      - name: Publish GitHub Release
+        if: needs.check.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+          SING_TUN_VER: ${{ env.SING_TUN_VER }}
+          INPUT_FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ "$INPUT_FORCE" = "true" ] && gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "${{ github.repository }}" -y
+          fi
+          NOTES=$(printf "Custom Mihomo build tracking upstream **%s** (sing-tun **%s**).\n\nApplied patches:\n- \`patches/sing-tun/0001-default-interface-priority.patch\`: declarative \`tun.default-interface-priority\` order + metric tie-break stickiness\n- \`patches/mihomo/0001-tun-interface-priority-and-reset-conns.patch\`: \`tun.default-interface-priority\` config wiring + stale connection & \`anytls\` session pool reset on default interface switch\n" "$TAG" "$SING_TUN_VER")
+          gh release create "$TAG" dist/*.zip dist/SHA256SUMS.txt \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --notes "$NOTES"
