@@ -9,7 +9,10 @@
    - Windows `checkUpdate()` 优先按 `PreferredInterfaces` 顺序选择已连接且具备默认路由的接口，不再受接口自动跃点数或链路速率波动影响；仅当列表内接口均不可用时回退到最小跃点（同跃点优先保持当前接口）。
 2. **`patches/mihomo/0001-tun-interface-priority-and-reset-conns.patch`**
    - 在 `tun:` 下新增 `default-interface-priority` 配置项（列表顺序即优先级）。
-   - 默认出口发生实际切换时（如 `Wi-Fi` 断开切换到 `Ethernet 2`），清理未显式绑定其他网卡的存量连接与 `anytls` 会话池，避免旧 socket 卡死超时；显式通过 `interface-name` 绑定在健康网卡（如 `pinned-direct` → `Ethernet 2`）的连接保持不断。
+   - 修复 `autoCloseProxyAdapter` 包装层方法透传并在默认出口发生实际切换时（如 `Wi-Fi` 断开切换到 `Ethernet 2`），限期并发清理未显式绑定其他网卡的存量连接与 `anytls` 会话池，避免旧 socket 卡死超时；显式通过 `interface-name` 绑定在健康网卡（如 `pinned-direct` → `Ethernet 2`）的连接保持不断。
+3. **`patches/mihomo/0002-outbound-reset-sessions.patch`**
+   - 为其余有状态/连接池/长连接协议逐一实现非破坏性 `ResetSessions()`（只清理失效连接或重建复用池，不永久关闭适配器，下次请求自动按新出口重建）：`singmux`（及级联内层协议）、`trojan`/`vless`/`vmess` 下的 `gun`（gRPC）/ `xhttp` / `mekya`、`hysteria2`（含 Realm 控制面）、`hysteria`、`tuic`（v4/v5）、`shadowquic`、`trusttunnel`、`ssh`、`snell`（复用池带代际校验防旧连接回池）、`shadowsocks+kcptun`、`sudoku`（mux 与 HTTPMask）、`mieru`、`masque`（L3/L4/H2）、`openvpn` 与 `wireguard`（触发 `BindUpdate()`）。
+   - 自带内置网络漫游引擎的 mesh VPN 守护进程（`tailscale`、`easytier`、`zerotier`）保留其原生漫游机制。
 
 ## 官方版本双向兼容性
 

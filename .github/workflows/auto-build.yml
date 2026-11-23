@@ -152,8 +152,11 @@ jobs:
           (
             cd upstream/mihomo
             go test -v ./transport/anytls/session ./listener/sing_tun
-            go test -v -run TestTunDefaultInterfacePriorityCompat ./config
-            GOOS=windows GOARCH=amd64 go test -tags with_gvisor -c -o /dev/null ./listener/sing_tun ./config ./listener/config ./adapter/outbound
+            go test -v -run 'TestTunDefaultInterfacePriorityCompat' ./config
+            go test -v -run 'TestPoolReset' ./component/pool ./transport/snell
+            go test -v -run 'TestClientResetSessions|TestReuseManagerAndClientResetSessions|TestPoolClientResetSessions' ./transport/gun ./transport/xhttp ./transport/mekya ./transport/tuic
+            go test -v -run 'TestAutoCloseAndSingMuxResetSessions|TestWireGuardResetSessionsCallsBindUpdate|TestOutboundResetSessionsNilSafe' ./adapter/outbound
+            GOOS=windows GOARCH=amd64 go test -tags with_gvisor -c -o /dev/null ./listener/sing_tun ./config ./listener/config ./adapter/outbound ./component/pool ./transport/anytls/session ./transport/gun ./transport/xhttp ./transport/mekya ./transport/tuic ./transport/tuic/v4 ./transport/tuic/v5 ./transport/hysteria/core ./transport/shadowquic ./transport/trusttunnel ./transport/snell ./transport/kcptun ./transport/sudoku ./transport/masque
           )
 
       - name: Refresh embedded CA certificates
@@ -206,7 +209,7 @@ jobs:
           if [ "$INPUT_FORCE" = "true" ] && gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             gh release delete "$TAG" --repo "${{ github.repository }}" -y
           fi
-          NOTES=$(printf "Custom Mihomo build tracking upstream **%s** (sing-tun **%s**).\n\nApplied patches:\n- \`patches/sing-tun/0001-default-interface-priority.patch\`: declarative \`tun.default-interface-priority\` order + metric tie-break stickiness\n- \`patches/mihomo/0001-tun-interface-priority-and-reset-conns.patch\`: \`tun.default-interface-priority\` config wiring + stale connection & \`anytls\` session pool reset on default interface switch\n" "$TAG" "$SING_TUN_VER")
+          NOTES=$(printf "Custom Mihomo build tracking upstream **%s** (sing-tun **%s**).\n\nApplied patches:\n- \`patches/sing-tun/0001-default-interface-priority.patch\`: declarative \`tun.default-interface-priority\` order + metric tie-break stickiness\n- \`patches/mihomo/0001-tun-interface-priority-and-reset-conns.patch\`: \`tun.default-interface-priority\` config wiring, \`autoCloseProxyAdapter\` unwrapping + stale connection & \`anytls\` session pool reset on default interface switch\n- \`patches/mihomo/0002-outbound-reset-sessions.patch\`: non-destructive \`ResetSessions()\` across remaining stateful/pooled outbound protocols (\`singmux\`, \`gun\`/\`xhttp\`/\`mekya\`, \`hysteria2\`/\`hysteria\`/\`tuic\`/\`shadowquic\`/\`trusttunnel\`, \`ssh\`/\`snell\`/\`kcptun\`/\`sudoku\`/\`mieru\`, \`masque\`/\`openvpn\`/\`wireguard\`)\n" "$TAG" "$SING_TUN_VER")
           gh release create "$TAG" dist/*.zip dist/SHA256SUMS.txt \
             --repo "${{ github.repository }}" \
             --title "$TAG" \

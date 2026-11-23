@@ -10,7 +10,11 @@ Problem:
    flows in statistic.DefaultManager and pooled anytls client sessions
    bound to the vanished source IP remain alive until long OS timeouts
    expire, stalling traffic failover.
-3. Custom configuration must stay bidirectionally compatible with
+3. adapter/parser.go wraps every parsed proxy adapter in
+   autoCloseProxyAdapter, whose embedded ProxyAdapter interface hides
+   extra methods like ResetSessions() from concrete type assertions
+   unless unwrapped or forwarded.
+4. Custom configuration must stay bidirectionally compatible with
    official Mihomo releases so users can switch kernels without editing
    config.yaml.
 
@@ -25,6 +29,9 @@ Solution:
   without strict field rejection) and silently ignore the unknown key,
   while custom builds omit the field when empty via omitempty and fall
   back to upstream metric selection when unset.
+- Export SessionResetter and expose Upstream()/ResetSessions() on
+  autoCloseProxyAdapter in adapter/outbound/base.go so session reset
+  reaches wrapped adapters without falsely matching plain adapters.
 - Add ResetSessions() to transport/anytls/session.Client,
   transport/anytls.Client, and adapter/outbound.AnyTLS, detaching
   active and idle sessions under locks and calling Session.Close()
@@ -32,11 +39,11 @@ Solution:
 - Track actual default-interface transitions (prevHas && prevName !=
   newName) in listener/sing_tun/server.go and invoke
   resetStaleConnectionsOnInterfaceChange() in listener/sing_tun/reset.go:
-  reset pooled sessions first (so stream dieHook observes
-  Session.IsClosed() and does not re-queue dead sessions), then close
-  tracked connections in statistic.DefaultManager, while preserving
-  proxies and connections explicitly pinned via interface-name to a
-  different active interface.
+  unwrap wrapped adapters, run ResetSessions() concurrently bounded by
+  500ms first (so stream dieHook observes Session.IsClosed() and does not
+  re-queue dead sessions), then close tracked connections in
+  statistic.DefaultManager while preserving proxies and connections
+  explicitly pinned via interface-name to a different active interface.
 - Add unit tests in config/tun_priority_test.go,
   listener/sing_tun/reset_test.go, and
   transport/anytls/session/client_reset_test.go.
@@ -58,6 +65,39 @@ index 9978661..ac9c274 100644
  func NewAnyTLS(option AnyTLSOption) (*AnyTLS, error) {
  	addr := net.JoinHostPort(option.Server, strconv.Itoa(option.Port))
  	outbound := &AnyTLS{
+diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go
+index d6942ba..0bf8f71 100644
+--- a/adapter/outbound/base.go
++++ b/adapter/outbound/base.go
+@@ -366,6 +366,11 @@ func NewPacketConn(pc net.PacketConn, a ProxyAdapter) C.PacketConn {
+ 	return cpc
+ }
+ 
++// SessionResetter clears stale pooled/persistent transport sessions without permanently closing the adapter.
++type SessionResetter interface {
++	ResetSessions()
++}
++
+ type AddRef interface {
+ 	AddRef(ref any)
+ }
+@@ -398,6 +403,16 @@ func (p *autoCloseProxyAdapter) ListenPacketContext(ctx context.Context, metadat
+ 	return pc, nil
+ }
+ 
++func (p *autoCloseProxyAdapter) ResetSessions() {
++	if r, ok := p.ProxyAdapter.(SessionResetter); ok {
++		r.ResetSessions()
++	}
++}
++
++func (p *autoCloseProxyAdapter) Upstream() any {
++	return p.ProxyAdapter
++}
++
+ func (p *autoCloseProxyAdapter) Close() error {
+ 	p.closeOnce.Do(func() {
+ 		log.Debugln("Closing outdated proxy [%s]", p.Name())
 diff --git a/config/config.go b/config/config.go
 index cc8c101..ba903eb 100644
 --- a/config/config.go
@@ -174,21 +214,44 @@ index 3cfa17a..e780fec 100644
  		return false
 diff --git a/listener/sing_tun/reset.go b/listener/sing_tun/reset.go
 new file mode 100644
-index 0000000..a8f2937
+index 0000000..9d194a2
 --- /dev/null
 +++ b/listener/sing_tun/reset.go
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,139 @@
 +package sing_tun
 +
 +import (
++	"sync"
++	"time"
++
 +	C "github.com/metacubex/mihomo/constant"
 +	P "github.com/metacubex/mihomo/constant/provider"
 +	"github.com/metacubex/mihomo/log"
 +	"github.com/metacubex/mihomo/tunnel/statistic"
 +)
 +
++const resetSessionTimeout = 500 * time.Millisecond
++
 +type sessionResetter interface {
 +	ResetSessions()
++}
++
++func unwrapAdapter(a any) any {
++	for range 8 {
++		if a == nil {
++			return nil
++		}
++		u, ok := a.(interface{ Upstream() any })
++		if !ok {
++			return a
++		}
++		next := u.Upstream()
++		if next == nil {
++			return a
++		}
++		a = next
++	}
++	return a
 +}
 +
 +func resetStaleConnectionsOnInterfaceChange(tunnel C.Tunnel, oldInterface string) {
@@ -243,20 +306,40 @@ index 0000000..a8f2937
 +
 +	// Reset pooled sessions first so stream close hooks see Session.IsClosed() == true
 +	// and do not re-queue dead sessions back into the idle pool.
++	resetters := make([]sessionResetter, 0)
 +	for _, p := range allProxies {
 +		if pinnedOther[p.Name()] {
 +			continue
 +		}
-+		target := any(p.Adapter())
++		target := unwrapAdapter(p.Adapter())
 +		if target == nil {
 +			target = p
 +		}
 +		if r, ok := target.(sessionResetter); ok {
-+			r.ResetSessions()
-+			resetPools++
++			resetters = append(resetters, r)
 +		} else if r, ok := any(p).(sessionResetter); ok {
-+			r.ResetSessions()
-+			resetPools++
++			resetters = append(resetters, r)
++		}
++	}
++
++	resetPools = len(resetters)
++	if resetPools > 0 {
++		var wg sync.WaitGroup
++		wg.Add(resetPools)
++		for _, r := range resetters {
++			go func(resetter sessionResetter) {
++				defer wg.Done()
++				resetter.ResetSessions()
++			}(r)
++		}
++		done := make(chan struct{})
++		go func() {
++			wg.Wait()
++			close(done)
++		}()
++		select {
++		case <-done:
++		case <-time.After(resetSessionTimeout):
 +		}
 +	}
 +
@@ -276,10 +359,10 @@ index 0000000..a8f2937
 +}
 diff --git a/listener/sing_tun/reset_test.go b/listener/sing_tun/reset_test.go
 new file mode 100644
-index 0000000..d708986
+index 0000000..e5d78f1
 --- /dev/null
 +++ b/listener/sing_tun/reset_test.go
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,140 @@
 +package sing_tun
 +
 +import (
@@ -294,39 +377,68 @@ index 0000000..d708986
 +	"github.com/metacubex/mihomo/tunnel/statistic"
 +)
 +
++type fakePlainAdapter struct {
++	name  string
++	iface string
++}
++
++func (f *fakePlainAdapter) Name() string                      { return f.name }
++func (f *fakePlainAdapter) Type() C.AdapterType               { return C.Direct }
++func (f *fakePlainAdapter) Addr() string                      { return "" }
++func (f *fakePlainAdapter) SupportUDP() bool                  { return true }
++func (f *fakePlainAdapter) ProxyInfo() C.ProxyInfo            { return C.ProxyInfo{Interface: f.iface} }
++func (f *fakePlainAdapter) MarshalJSON() ([]byte, error)      { return []byte(`{}`), nil }
++func (f *fakePlainAdapter) DialContext(context.Context, *C.Metadata) (C.Conn, error) {
++	return nil, nil
++}
++func (f *fakePlainAdapter) ListenPacketContext(context.Context, *C.Metadata) (C.PacketConn, error) {
++	return nil, nil
++}
++func (f *fakePlainAdapter) SupportUOT() bool                  { return false }
++func (f *fakePlainAdapter) IsL3Protocol(*C.Metadata) bool     { return false }
++func (f *fakePlainAdapter) Unwrap(*C.Metadata, bool) C.Proxy  { return nil }
++func (f *fakePlainAdapter) Close() error                      { return nil }
++
 +type fakeAdapter struct {
-+	name      string
-+	iface     string
++	fakePlainAdapter
 +	resetHits int
 +}
 +
-+func (f *fakeAdapter) Name() string                      { return f.name }
-+func (f *fakeAdapter) Type() C.AdapterType               { return C.Direct }
-+func (f *fakeAdapter) Addr() string                      { return "" }
-+func (f *fakeAdapter) SupportUDP() bool                  { return true }
-+func (f *fakeAdapter) ProxyInfo() C.ProxyInfo            { return C.ProxyInfo{Interface: f.iface} }
-+func (f *fakeAdapter) MarshalJSON() ([]byte, error)      { return []byte(`{}`), nil }
-+func (f *fakeAdapter) DialContext(context.Context, *C.Metadata) (C.Conn, error) {
-+	return nil, nil
++func (f *fakeAdapter) ResetSessions() { f.resetHits++ }
++
++type fakeUpstreamWrapper struct {
++	C.ProxyAdapter
 +}
-+func (f *fakeAdapter) ListenPacketContext(context.Context, *C.Metadata) (C.PacketConn, error) {
-+	return nil, nil
-+}
-+func (f *fakeAdapter) SupportUOT() bool                  { return false }
-+func (f *fakeAdapter) IsL3Protocol(*C.Metadata) bool     { return false }
-+func (f *fakeAdapter) Unwrap(*C.Metadata, bool) C.Proxy  { return nil }
-+func (f *fakeAdapter) Close() error                      { return nil }
-+func (f *fakeAdapter) ResetSessions()                    { f.resetHits++ }
++
++func (w *fakeUpstreamWrapper) Upstream() any { return w.ProxyAdapter }
 +
 +type fakeProxy struct {
-+	*fakeAdapter
++	adapter C.ProxyAdapter
 +}
 +
-+func (p *fakeProxy) Adapter() C.ProxyAdapter                        { return p.fakeAdapter }
-+func (p *fakeProxy) AliveForTestUrl(string) bool                    { return true }
-+func (p *fakeProxy) DelayHistory() []C.DelayHistory                 { return nil }
-+func (p *fakeProxy) ExtraDelayHistories() map[string]C.ProxyState   { return nil }
-+func (p *fakeProxy) LastDelayForTestUrl(string) uint16              { return 0 }
++func (p *fakeProxy) Name() string                      { return p.adapter.Name() }
++func (p *fakeProxy) Type() C.AdapterType               { return p.adapter.Type() }
++func (p *fakeProxy) Addr() string                      { return p.adapter.Addr() }
++func (p *fakeProxy) SupportUDP() bool                  { return p.adapter.SupportUDP() }
++func (p *fakeProxy) ProxyInfo() C.ProxyInfo            { return p.adapter.ProxyInfo() }
++func (p *fakeProxy) MarshalJSON() ([]byte, error)      { return p.adapter.MarshalJSON() }
++func (p *fakeProxy) DialContext(ctx context.Context, m *C.Metadata) (C.Conn, error) {
++	return p.adapter.DialContext(ctx, m)
++}
++func (p *fakeProxy) ListenPacketContext(ctx context.Context, m *C.Metadata) (C.PacketConn, error) {
++	return p.adapter.ListenPacketContext(ctx, m)
++}
++func (p *fakeProxy) SupportUOT() bool                  { return p.adapter.SupportUOT() }
++func (p *fakeProxy) IsL3Protocol(m *C.Metadata) bool   { return p.adapter.IsL3Protocol(m) }
++func (p *fakeProxy) Unwrap(m *C.Metadata, touch bool) C.Proxy { return p.adapter.Unwrap(m, touch) }
++func (p *fakeProxy) Close() error                      { return p.adapter.Close() }
++func (p *fakeProxy) Adapter() C.ProxyAdapter           { return p.adapter }
++func (p *fakeProxy) AliveForTestUrl(string) bool       { return true }
++func (p *fakeProxy) DelayHistory() []C.DelayHistory    { return nil }
++func (p *fakeProxy) ExtraDelayHistories() map[string]C.ProxyState {
++	return nil
++}
++func (p *fakeProxy) LastDelayForTestUrl(string) uint16 { return 0 }
 +func (p *fakeProxy) URLTest(context.Context, string, utils.IntRanges[uint16]) (uint16, error) {
 +	return 0, nil
 +}
@@ -345,12 +457,14 @@ index 0000000..d708986
 +func (t *fakeTracker) RemoteDestination() string     { return "" }
 +
 +func TestResetStaleState(t *testing.T) {
-+	pinnedProxy := &fakeProxy{fakeAdapter: &fakeAdapter{name: "pinned-direct", iface: "Ethernet 2"}}
-+	defaultProxy := &fakeProxy{fakeAdapter: &fakeAdapter{name: "default-proxy", iface: ""}}
++	pinnedInner := &fakeAdapter{fakePlainAdapter: fakePlainAdapter{name: "pinned-direct", iface: "Ethernet 2"}}
++	defaultInner := &fakeAdapter{fakePlainAdapter: fakePlainAdapter{name: "default-proxy", iface: ""}}
++	plainInner := &fakePlainAdapter{name: "plain-direct", iface: ""}
 +
 +	proxies := map[string]C.Proxy{
-+		"pinned-direct": pinnedProxy,
-+		"default-proxy": defaultProxy,
++		"pinned-direct": &fakeProxy{adapter: &fakeUpstreamWrapper{ProxyAdapter: pinnedInner}},
++		"default-proxy": &fakeProxy{adapter: &fakeUpstreamWrapper{ProxyAdapter: defaultInner}},
++		"plain-direct":  &fakeProxy{adapter: &fakeUpstreamWrapper{ProxyAdapter: plainInner}},
 +	}
 +
 +	mgr := &statistic.Manager{}
@@ -382,11 +496,11 @@ index 0000000..d708986
 +	if pinnedTracker.closed {
 +		t.Fatal("expected pinned-direct connection pinned to Ethernet 2 to remain open")
 +	}
-+	if defaultProxy.resetHits != 1 {
-+		t.Fatalf("expected default-proxy ResetSessions to be called once, got %d", defaultProxy.resetHits)
++	if defaultInner.resetHits != 1 {
++		t.Fatalf("expected wrapped default-proxy ResetSessions to be called once, got %d", defaultInner.resetHits)
 +	}
-+	if pinnedProxy.resetHits != 0 {
-+		t.Fatalf("expected pinned-direct ResetSessions not to be called, got %d", pinnedProxy.resetHits)
++	if pinnedInner.resetHits != 0 {
++		t.Fatalf("expected pinned-direct ResetSessions not to be called, got %d", pinnedInner.resetHits)
 +	}
 +}
 diff --git a/listener/sing_tun/server.go b/listener/sing_tun/server.go
