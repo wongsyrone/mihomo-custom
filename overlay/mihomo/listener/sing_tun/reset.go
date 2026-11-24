@@ -5,7 +5,9 @@
 // statistic.DefaultManager and pooled outbound client sessions remain bound to
 // the vanished source IP until long timeouts expire, stalling failover. In
 // addition, parsed proxy adapters are wrapped in autoCloseProxyAdapter, which
-// hides extra methods from type assertions unless unwrapped.
+// hides extra methods from type assertions unless unwrapped. On failback to a
+// higher-priority adapter (e.g., Wi-Fi recovering over healthy Ethernet 2),
+// pinned or OS-routed connections on still-healthy interfaces must not be reset.
 //
 // Solution:
 // Track actual default-interface transitions via interfaceSwitchTracker and
@@ -14,19 +16,24 @@
 //    500ms first so session pools mark closed and close hooks do not re-queue
 //    dead sessions.
 // 2. Close active tracked connections in statistic.DefaultManager while
-//    preserving proxies and connections explicitly pinned via interface-name
-//    to a different healthy interface.
+//    preserving proxies and OS-routed DIRECT connections whose interface
+//    remains healthy (either different from oldInterface or still up with a
+//    non-link-local address).
 
 package sing_tun
 
 import (
+	"net"
+	"net/netip"
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/component/iface"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel/statistic"
+	tun "github.com/metacubex/sing-tun"
 	"github.com/metacubex/sing/common/control"
 )
 
@@ -37,9 +44,12 @@ type sessionResetter interface {
 }
 
 type interfaceSwitchTracker struct {
-	mu      sync.Mutex
-	hasLast bool
-	last    string
+	mu                 sync.Mutex
+	hasLast            bool
+	last               string
+	tunName            string
+	monitor            tun.DefaultInterfaceMonitor
+	isInterfaceHealthy func(name string) bool
 }
 
 func (t *interfaceSwitchTracker) record(newName string) (prev string, changed bool) {
@@ -58,8 +68,29 @@ func (t *interfaceSwitchTracker) onInterfaceUpdate(defaultInterface *control.Int
 		newName = defaultInterface.Name
 	}
 	if prev, changed := t.record(newName); changed {
-		resetStaleConnectionsOnInterfaceChange(tunnel, prev)
+		healthFn := t.isInterfaceHealthy
+		if healthFn == nil {
+			healthFn = defaultInterfaceHealthy
+		}
+		resetStaleConnectionsOnInterfaceChange(tunnel, prev, t.monitor, t.tunName, healthFn)
 	}
+}
+
+func defaultInterfaceHealthy(name string) bool {
+	if name == "" {
+		return false
+	}
+	ifObj, err := iface.ResolveInterface(name)
+	if err != nil || ifObj == nil || ifObj.Flags&net.FlagUp == 0 {
+		return false
+	}
+	for _, prefix := range ifObj.Addresses {
+		addr := prefix.Addr().Unmap()
+		if addr.IsValid() && !addr.IsLinkLocalUnicast() && !addr.IsLoopback() {
+			return true
+		}
+	}
+	return false
 }
 
 func unwrapAdapter(a any) any {
@@ -80,7 +111,7 @@ func unwrapAdapter(a any) any {
 	return a
 }
 
-func resetStaleConnectionsOnInterfaceChange(tunnel C.Tunnel, oldInterface string) {
+func resetStaleConnectionsOnInterfaceChange(tunnel C.Tunnel, oldInterface string, monitor tun.DefaultInterfaceMonitor, tunName string, isHealthy func(string) bool) {
 	var proxies map[string]C.Proxy
 	if pl, ok := tunnel.(interface{ Proxies() map[string]C.Proxy }); ok {
 		proxies = pl.Proxies()
@@ -89,13 +120,30 @@ func resetStaleConnectionsOnInterfaceChange(tunnel C.Tunnel, oldInterface string
 	if rp, ok := tunnel.(P.Tunnel); ok {
 		providers = rp.Providers()
 	}
-	closedConns, resetPools := resetStaleState(proxies, providers, statistic.DefaultManager, oldInterface)
+	var routeLookup func(netip.Addr) string
+	if monitor != nil {
+		routeLookup = func(dst netip.Addr) string {
+			return routeInterfaceForAddr(monitor, tunName, dst)
+		}
+	}
+	closedConns, resetPools := resetStaleStateWithOpts(proxies, providers, statistic.DefaultManager, oldInterface, isHealthy, routeLookup)
 	if closedConns > 0 || resetPools > 0 {
 		log.Warnln("[TUN] reset stale state after interface switch (from %q): closed %d connections, reset %d session pools", oldInterface, closedConns, resetPools)
 	}
 }
 
 func resetStaleState(proxies map[string]C.Proxy, providers map[string]P.ProxyProvider, manager *statistic.Manager, oldInterface string) (closedConns int, resetPools int) {
+	return resetStaleStateWithOpts(proxies, providers, manager, oldInterface, nil, nil)
+}
+
+func resetStaleStateWithOpts(
+	proxies map[string]C.Proxy,
+	providers map[string]P.ProxyProvider,
+	manager *statistic.Manager,
+	oldInterface string,
+	isHealthy func(string) bool,
+	routeLookup func(netip.Addr) string,
+) (closedConns int, resetPools int) {
 	allProxies := make([]C.Proxy, 0, len(proxies))
 	seen := make(map[string]struct{}, len(proxies))
 	addProxy := func(p C.Proxy) {
@@ -122,11 +170,29 @@ func resetStaleState(proxies map[string]C.Proxy, providers map[string]P.ProxyPro
 		}
 	}
 
-	pinnedOther := make(map[string]bool)
+	interfaceStillHealthy := func(ifName string) bool {
+		if ifName == "" {
+			return false
+		}
+		if ifName != oldInterface {
+			return true
+		}
+		return isHealthy != nil && isHealthy(ifName)
+	}
+
+	preserveProxy := make(map[string]bool)
+	unpinnedDirect := map[string]bool{
+		"DIRECT":     true,
+		"COMPATIBLE": true,
+	}
 	for _, p := range allProxies {
 		ifName := p.ProxyInfo().Interface
-		if ifName != "" && ifName != oldInterface {
-			pinnedOther[p.Name()] = true
+		if ifName != "" {
+			if interfaceStillHealthy(ifName) {
+				preserveProxy[p.Name()] = true
+			}
+		} else if p.Type() == C.Direct {
+			unpinnedDirect[p.Name()] = true
 		}
 	}
 
@@ -134,7 +200,7 @@ func resetStaleState(proxies map[string]C.Proxy, providers map[string]P.ProxyPro
 	// and do not re-queue dead sessions back into idle pools.
 	resetters := make([]sessionResetter, 0)
 	for _, p := range allProxies {
-		if pinnedOther[p.Name()] {
+		if preserveProxy[p.Name()] {
 			continue
 		}
 		target := unwrapAdapter(p.Adapter())
@@ -172,8 +238,17 @@ func resetStaleState(proxies map[string]C.Proxy, providers map[string]P.ProxyPro
 	if manager != nil {
 		manager.Range(func(c statistic.Tracker) bool {
 			info := c.Info()
-			if info != nil && len(info.Chain) > 0 && pinnedOther[info.Chain[0]] {
-				return true
+			if info != nil && len(info.Chain) > 0 {
+				leaf := info.Chain[0]
+				if preserveProxy[leaf] {
+					return true
+				}
+				if unpinnedDirect[leaf] && routeLookup != nil && info.Metadata != nil && info.Metadata.DstIP.IsValid() {
+					routedIf := routeLookup(info.Metadata.DstIP)
+					if interfaceStillHealthy(routedIf) {
+						return true
+					}
+				}
 			}
 			_ = c.Close()
 			closedConns++

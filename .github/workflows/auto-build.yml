@@ -148,7 +148,7 @@ jobs:
           set -euo pipefail
           (
             cd upstream/sing-tun
-            go test -v -run TestSelectDefaultInterface .
+            go test -v -run 'TestSelectDefaultInterface|TestRouteTable|TestRouteInterface' .
             GOOS=windows GOARCH=amd64 go test -c -o /dev/null .
             GOOS=linux GOARCH=amd64 go test -c -o /dev/null .
             GOOS=darwin GOARCH=arm64 go test -c -o /dev/null .
@@ -231,7 +231,7 @@ jobs:
           if [ "$INPUT_FORCE" = "true" ] && gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             gh release delete "$TAG" --repo "${{ github.repository }}" -y
           fi
-          NOTES=$(printf "Custom Mihomo build tracking upstream **%s** (sing-tun **%s**) via Package Overlays + Go AST Semantic Patcher.\n\nRelease binaries:\n- Windows: \`amd64\` (v3), \`amd64-compatible\` (v1), \`arm64\` (\`.zip\`)\n- Linux: \`amd64\` (v3), \`arm64\` (\`.gz\`)\n- macOS: \`amd64\` (v3), \`arm64\` (\`.gz\`)\n\nApplied semantic features:\n- \`sing-tun\` overlay + AST patch: declarative \`tun.default-interface-priority\` order + metric tie-break stickiness on Windows, Linux (\`netlink\`), and macOS (\`AF_ROUTE\`)\n- \`mihomo\` TUN overlay + AST patch: \`tun.default-interface-priority\` config wiring, \`autoCloseProxyAdapter\` unwrapping, and bounded stale connection reset on default interface switch\n- \`mihomo\` Outbound overlay + AST patch: non-destructive \`ResetSessions()\` across \`anytls\`, \`singmux\`, \`gun\`/\`xhttp\`/\`mekya\`, \`hysteria2\`/\`hysteria\`/\`tuic\`/\`shadowquic\`/\`trusttunnel\`, \`ssh\`/\`snell\`/\`kcptun\`/\`sudoku\`/\`mieru\`, \`masque\`/\`openvpn\`/\`wireguard\`\n" "$TAG" "$SING_TUN_VER")
+          NOTES=$(printf "Custom Mihomo build tracking upstream **%s** (sing-tun **%s**) via Package Overlays + Go AST Semantic Patcher.\n\nRelease binaries:\n- Windows: \`amd64\` (v3), \`amd64-compatible\` (v1), \`arm64\` (\`.zip\`)\n- Linux: \`amd64\` (v3), \`arm64\` (\`.gz\`)\n- macOS: \`amd64\` (v3), \`arm64\` (\`.gz\`)\n\nApplied semantic features:\n- \`sing-tun\` overlay + AST patch: declarative \`tun.default-interface-priority\` order + metric tie-break stickiness and OS non-default route table lookup (\`RouteInterface\`) on Windows, Linux (\`netlink\`), and macOS (\`AF_ROUTE\`)\n- \`mihomo\` TUN overlay + AST patch: \`tun.default-interface-priority\` config wiring, route-aware \`cDialerInterfaceFinder\`, \`autoCloseProxyAdapter\` unwrapping, and bounded stale connection reset preserving healthy pinned/routed interfaces on default interface switch\n- \`mihomo\` Outbound overlay + AST patch: non-destructive \`ResetSessions()\` across \`anytls\`, \`singmux\`, \`gun\`/\`xhttp\`/\`mekya\`, \`hysteria2\`/\`hysteria\`/\`tuic\`/\`shadowquic\`/\`trusttunnel\`, \`ssh\`/\`snell\`/\`kcptun\`/\`sudoku\`/\`mieru\`, \`masque\`/\`openvpn\`/\`wireguard\`\n" "$TAG" "$SING_TUN_VER")
           gh release create "$TAG" dist/*.zip dist/*.gz dist/SHA256SUMS.txt \
             --repo "${{ github.repository }}" \
             --title "$TAG" \

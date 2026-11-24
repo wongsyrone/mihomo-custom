@@ -15,8 +15,9 @@
 
 1. **声明式默认出口优先级（`tun.default-interface-priority`）**
    - 同步覆盖 Windows（`monitor_windows.go`）、Linux（`monitor_linux_default.go` / netlink `Priority`）与 macOS（`monitor_darwin.go` / BSD RIB + `RTF_IFSCOPE`）：`checkUpdate()` 优先按 `tun.default-interface-priority` 列表顺序选择已连接且具备默认路由的接口，不受自动跃点数、链路速率波动或路由表顺序影响；仅当列表内接口均不可用时回退到最小跃点（同跃点优先保持当前接口）。
+   - **OS 非默认明细路由优先保留**：`cDialerInterfaceFinder` 先通过 `RouteInterface()` 按最长前缀匹配查询 OS 非默认路由表（如内网网段静态路由或 VPN / 虚拟网卡路由，排除 TUN 自身），命中时走对应网卡而非强制劫持到 `default-interface-priority` 主网卡。
 2. **切网存量连接与全协议会话池非破坏性重置**
-   - 修复 `autoCloseProxyAdapter` 包装层方法透传，在默认出口发生实际切换时（如 `Wi-Fi` 断开切换到 `Ethernet 2`），以 `500ms` 上限并发触发未绑定其他健康网卡的适配器重置并关闭 `statistic.DefaultManager` 存量连接；显式通过 `interface-name` 绑定在健康网卡（如 `pinned-direct` → `Ethernet 2`）的连接保持不断。
+   - 修复 `autoCloseProxyAdapter` 包装层方法透传，在默认出口发生实际切换时（如 `Wi-Fi` 断开切换到 `Ethernet 2`），以 `500ms` 上限并发触发未绑定其他健康网卡的适配器重置并关闭 `statistic.DefaultManager` 存量连接；显式通过 `interface-name` 绑定在健康网卡（如 `pinned-direct` → `Ethernet 2`）以及通过健康非默认路由网卡出站的 `DIRECT` 连接在主备切换与回切时保持不断。
    - 覆盖全部有状态 / 连接池 / 长连接协议，清理旧套接字后仍保留下次拨号自动重建能力：`anytls`、`singmux`（及级联内层适配器）、`trojan`/`vless`/`vmess` 下的 `gun`（gRPC）/ `xhttp` / `mekya`、`hysteria2`（含 Realm 控制面）、`hysteria`、`tuic`（v4/v5）、`shadowquic`、`trusttunnel`、`ssh`、`snell`（复用池带代际校验防旧连接回池）、`shadowsocks+kcptun`、`sudoku`（mux 与 HTTPMask）、`mieru`、`masque`（L3/L4/H2）、`openvpn` 与 `wireguard`（触发 `BindUpdate()`）。
    - 自带内置网络漫游引擎的 mesh VPN 守护进程（`tailscale`、`easytier`、`zerotier`）保留其原生漫游机制。
 

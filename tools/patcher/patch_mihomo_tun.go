@@ -161,7 +161,7 @@ func patchMihomoSingTunServerGo(path string) error {
 				}
 				ifaceArg := fieldListParamName(fl.Type.Params, 0, "defaultInterface")
 				fl.Body.List = append(fl.Body.List, mustParseStmt(fmt.Sprintf("_ifSwitchTracker.onInterfaceUpdate(%s, %s)", ifaceArg, tunnelParam)))
-				block.List = insertStmts(block.List, i, mustParseStmt("var _ifSwitchTracker interfaceSwitchTracker"))
+				block.List = insertStmts(block.List, i, mustParseStmt("_ifSwitchTracker := interfaceSwitchTracker{tunName: tunName, monitor: defaultInterfaceMonitor}"))
 				patchedCallback = true
 				return false
 			}
@@ -170,6 +170,18 @@ func patchMihomoSingTunServerGo(path string) error {
 		if !patchedCallback {
 			return fmt.Errorf("defaultInterfaceMonitor.RegisterCallback(...) not found in New")
 		}
+
+		finderFn, err := findFuncDecl(file, "cDialerInterfaceFinder", "DefaultInterfaceName")
+		if err != nil {
+			return err
+		}
+		finderRecv := receiverName(finderFn)
+		if finderRecv == "" {
+			return fmt.Errorf("cDialerInterfaceFinder.DefaultInterfaceName has unnamed receiver")
+		}
+		destParam := paramName(finderFn, 0, "destination")
+		routeGuard := mustParseStmt(fmt.Sprintf("if routeIfName := %s.routeInterfaceName(%s); routeIfName != \"\" { return routeIfName }", finderRecv, destParam))
+		finderFn.Body.List = insertStmts(finderFn.Body.List, 0, routeGuard)
 		return nil
 	})
 }

@@ -8,8 +8,9 @@
 //
 // Solution:
 // 1. Add PreferredInterfaces []string to DefaultInterfaceMonitorOptions (monitor.go).
-// 2. Store filtered preferredInterfaces on defaultInterfaceMonitor and wire it in
-//    NewDefaultInterfaceMonitor (monitor_shared.go).
+// 2. Store filtered preferredInterfaces and routeTable on defaultInterfaceMonitor,
+//    wire PreferredInterfaces in NewDefaultInterfaceMonitor, and refresh the OS
+//    non-default route table in postCheckUpdate (monitor_shared.go).
 // 3. Replace checkUpdate() selection in monitor_windows.go, monitor_linux_default.go,
 //    and monitor_darwin.go with the overlay defaultRouteSelector helper, honoring
 //    PreferredInterfaces order first and breaking equal-metric ties in favor of the
@@ -61,6 +62,7 @@ func patchSingTunMonitorSharedGo(path string) error {
 			return err
 		}
 		addStructField(st, "preferredInterfaces", mustParseField("preferredInterfaces []string"))
+		addStructField(st, "routeTable", mustParseField("routeTable atomic.Pointer[routeTable]"))
 
 		fn, err := findFuncDecl(file, "", "NewDefaultInterfaceMonitor")
 		if err != nil {
@@ -84,6 +86,34 @@ func patchSingTunMonitorSharedGo(path string) error {
 			return fmt.Errorf("composite literal &defaultInterfaceMonitor{...} not found in NewDefaultInterfaceMonitor")
 		}
 		addCompositeLitKV(targetLit, "preferredInterfaces", mustParseExpr(fmt.Sprintf("filterPreferredInterfaces(%s.PreferredInterfaces)", optParam)))
+
+		postFn, err := findFuncDecl(file, "defaultInterfaceMonitor", "postCheckUpdate")
+		if err != nil {
+			return err
+		}
+		postRecv := receiverName(postFn)
+		if postRecv == "" {
+			return fmt.Errorf("postCheckUpdate has unnamed receiver")
+		}
+		checkIdx := -1
+		for i, stmt := range postFn.Body.List {
+			as, ok := stmt.(*ast.AssignStmt)
+			if !ok || len(as.Rhs) != 1 {
+				continue
+			}
+			call, ok := as.Rhs[0].(*ast.CallExpr)
+			if !ok || len(call.Args) != 0 {
+				continue
+			}
+			if exprIsSelector(call.Fun, postRecv, "checkUpdate") {
+				checkIdx = i
+				break
+			}
+		}
+		if checkIdx < 0 {
+			return fmt.Errorf("%s.checkUpdate() call not found in postCheckUpdate", postRecv)
+		}
+		postFn.Body.List = insertStmts(postFn.Body.List, checkIdx, mustParseStmt(fmt.Sprintf("%s.refreshRouteTable()", postRecv)))
 		return nil
 	})
 }

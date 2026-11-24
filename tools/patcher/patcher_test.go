@@ -88,6 +88,19 @@ func NewDefaultInterfaceMonitor(networkMonitor any, logger any, options DefaultI
 		logger:                logger,
 	}, nil
 }
+
+func (m *defaultInterfaceMonitor) postCheckUpdate() {
+	m.checkAccess.Lock()
+	defer m.checkAccess.Unlock()
+	err := m.interfaceFinder.Update()
+	if err != nil {
+		return
+	}
+	err = m.checkUpdate()
+	if err != nil {
+		return
+	}
+}
 `,
 		"monitor_windows.go": `package tun
 
@@ -212,6 +225,10 @@ func (m *defaultInterfaceMonitor) checkUpdate() error {
 	if !strings.Contains(got["monitor_shared.go"], "filterPreferredInterfaces(options.PreferredInterfaces)") {
 		t.Fatalf("monitor_shared.go missing preferredInterfaces wiring:\n%s", got["monitor_shared.go"])
 	}
+	if !strings.Contains(collapseWS(got["monitor_shared.go"]), "routeTable atomic.Pointer[routeTable]") ||
+		!strings.Contains(got["monitor_shared.go"], "m.refreshRouteTable()") {
+		t.Fatalf("monitor_shared.go missing routeTable wiring:\n%s", got["monitor_shared.go"])
+	}
 	if strings.Contains(got["monitor_windows.go"], "lowestMetric") {
 		t.Fatalf("monitor_windows.go still contains lowestMetric:\n%s", got["monitor_windows.go"])
 	}
@@ -283,6 +300,7 @@ func (t *Tun) Equal(other Tun) bool {
 		"listener/sing_tun/server.go": `package sing_tun
 
 func New(options LC.Tun, tunnel C.Tunnel) error {
+	tunName := options.Device
 	if options.AutoRoute || options.AutoDetectInterface {
 		defaultInterfaceMonitor, err = tun.NewDefaultInterfaceMonitor(networkUpdateMonitor, log.SingLogger, tun.DefaultInterfaceMonitorOptions{InterfaceFinder: interfaceFinder, OverrideAndroidVPN: overrideAndroidVPN})
 		if err != nil {
@@ -294,6 +312,13 @@ func New(options LC.Tun, tunnel C.Tunnel) error {
 		})
 	}
 	return nil
+}
+
+func (d *cDialerInterfaceFinder) DefaultInterfaceName(destination netip.Addr) string {
+	if netInterface := d.defaultInterfaceMonitor.DefaultInterface(); netInterface != nil {
+		return netInterface.Name
+	}
+	return ""
 }
 `,
 		"adapter/outbound/wireguard.go": `package outbound
@@ -459,8 +484,10 @@ func (w *Masque) startLocked(ctx context.Context) error {
 	if !strings.Contains(got["listener/config/tun.go"], "slices.Equal(t.DefaultInterfacePriority, other.DefaultInterfacePriority)") {
 		t.Fatalf("listener/config/tun.go missing Equal check:\n%s", got["listener/config/tun.go"])
 	}
-	if !strings.Contains(got["listener/sing_tun/server.go"], "_ifSwitchTracker.onInterfaceUpdate(defaultInterface, tunnel)") {
-		t.Fatalf("server.go missing interface switch hook:\n%s", got["listener/sing_tun/server.go"])
+	if !strings.Contains(got["listener/sing_tun/server.go"], "_ifSwitchTracker.onInterfaceUpdate(defaultInterface, tunnel)") ||
+		!strings.Contains(got["listener/sing_tun/server.go"], "_ifSwitchTracker := interfaceSwitchTracker{tunName: tunName, monitor: defaultInterfaceMonitor}") ||
+		!strings.Contains(got["listener/sing_tun/server.go"], "d.routeInterfaceName(destination)") {
+		t.Fatalf("server.go missing interface switch or route lookup hook:\n%s", got["listener/sing_tun/server.go"])
 	}
 	if !strings.Contains(got["adapter/outbound/wireguard.go"], "BindUpdate() error") {
 		t.Fatalf("wireguard.go missing BindUpdate:\n%s", got["adapter/outbound/wireguard.go"])
@@ -485,17 +512,25 @@ func TestPatchFailsExplicitlyOnMissingAnchor(t *testing.T) {
 	dir := t.TempDir()
 	writeFixtureFiles(t, dir, map[string]string{
 		"monitor.go":               "package tun\ntype RenamedOptions struct{}\n",
+		"monitor_shared.go":        "package tun\ntype defaultInterfaceMonitor struct{}\nfunc NewDefaultInterfaceMonitor(networkMonitor any, logger any, options DefaultInterfaceMonitorOptions) (any, error) { return &defaultInterfaceMonitor{}, nil }\n",
 		"monitor_linux_default.go": "package tun\nfunc (m *defaultInterfaceMonitor) checkUpdate() error { return nil }\n",
 		"monitor_darwin.go":        "package tun\nfunc (m *defaultInterfaceMonitor) checkUpdate() error { return nil }\n",
+		"server.go":                "package sing_tun\nfunc New(options LC.Tun, tunnel C.Tunnel) error {\n\tdefaultInterfaceMonitor, _ = tun.NewDefaultInterfaceMonitor(networkUpdateMonitor, log.SingLogger, tun.DefaultInterfaceMonitorOptions{InterfaceFinder: interfaceFinder})\n\tdefaultInterfaceMonitor.RegisterCallback(func(defaultInterface *control.Interface, event int) {})\n\treturn nil\n}\n",
 	})
 	if err := patchSingTunMonitorGo(filepath.Join(dir, "monitor.go")); err == nil {
 		t.Fatal("expected error when DefaultInterfaceMonitorOptions is missing")
+	}
+	if err := patchSingTunMonitorSharedGo(filepath.Join(dir, "monitor_shared.go")); err == nil || !strings.Contains(err.Error(), "postCheckUpdate") {
+		t.Fatalf("expected postCheckUpdate missing error, got %v", err)
 	}
 	if err := patchSingTunMonitorLinuxDefaultGo(filepath.Join(dir, "monitor_linux_default.go")); err == nil {
 		t.Fatal("expected error when routes range loop is missing in monitor_linux_default.go")
 	}
 	if err := patchSingTunMonitorDarwinGo(filepath.Join(dir, "monitor_darwin.go")); err == nil {
 		t.Fatal("expected error when routeMessages range loop is missing in monitor_darwin.go")
+	}
+	if err := patchMihomoSingTunServerGo(filepath.Join(dir, "server.go")); err == nil || !strings.Contains(err.Error(), "DefaultInterfaceName") {
+		t.Fatalf("expected DefaultInterfaceName missing error, got %v", err)
 	}
 }
 
